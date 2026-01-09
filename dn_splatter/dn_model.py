@@ -1030,14 +1030,6 @@ class DNSplatterModel(SplatfactoModel):
                 self.step_post_backward,
             )
         )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.refinement_after,
-                update_every_num_iters=self.config.refine_every,
-                args=[training_callback_attributes.optimizers],
-            )
-        )
 
         return cbs
 
