@@ -27,6 +27,7 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
 # gsplat 1.4.0+ compatibility - API changed from 1.0.0
 try:
@@ -253,6 +254,42 @@ class DNSplatterModel(SplatfactoModel):
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
+
+        # Strategy for GS densification (required by SplatfactoModel.step_post_backward)
+        if self.config.strategy == "default":
+            self.strategy = DefaultStrategy(
+                prune_opa=self.config.cull_alpha_thresh,
+                grow_grad2d=self.config.densify_grad_thresh,
+                grow_scale3d=self.config.densify_size_thresh,
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True,
+            )
+            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        elif self.config.strategy == "mcmc":
+            self.strategy = MCMCStrategy(
+                cap_max=self.config.max_gs_num,
+                noise_lr=self.config.noise_lr,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                refine_every=self.config.refine_every,
+                min_opacity=self.config.cull_alpha_thresh,
+                verbose=False,
+            )
+            self.strategy_state = self.strategy.initialize_state()
+        else:
+            raise ValueError(
+                f"Splatfacto does not support strategy {self.config.strategy}; supported: default, mcmc."
+            )
 
         if self.config.regularization_strategy == "dn-splatter":
             self.regularization_strategy = DNRegularization()
@@ -490,7 +527,10 @@ class DNSplatterModel(SplatfactoModel):
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        render_mode = "RGB+ED"
+        if self.config.output_depth_during_training or not self.training:
+            render_mode = "RGB+ED"
+        else:
+            render_mode = "RGB"
 
         if self.config.sh_degree > 0:
             sh_degree_to_use = min(
@@ -500,7 +540,7 @@ class DNSplatterModel(SplatfactoModel):
             colors_crop = torch.sigmoid(colors_crop)
             sh_degree_to_use = None
 
-        render, alpha, info = rasterization(
+        render, alpha, self.info = rasterization(
             means=means_crop,
             quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
             scales=torch.exp(scales_crop),
@@ -517,11 +557,18 @@ class DNSplatterModel(SplatfactoModel):
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            absgrad=True,
+            absgrad=self.strategy.absgrad
+            if isinstance(self.strategy, DefaultStrategy)
+            else False,
             rasterize_mode=self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
+        info = self.info
+        if self.training:
+            self.strategy.step_pre_backward(
+                self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
+            )
         if self.training and info["means2d"].requires_grad:
             info["means2d"].retain_grad()
         self.xys = info["means2d"]  # [1, N, 2]
