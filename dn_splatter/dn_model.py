@@ -17,9 +17,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from dn_splatter.losses import DepthLoss, DepthLossType, TVLoss
 from dn_splatter.metrics import DepthMetrics, NormalMetrics, RGBMetrics
-from dn_splatter.regularization_strategy import (
-    DNRegularization,
-)
 from dn_splatter.regularization_strategy import AGSMeshRegularization, DNRegularization
 
 from dn_splatter.utils.camera_utils import get_colored_points_from_depth, project_pix
@@ -30,9 +27,19 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat import rasterize_gaussians
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
-from gsplat.cuda_legacy._wrapper import num_sh_bases
+
+# gsplat 1.4.0+ compatibility - API changed from 1.0.0
+try:
+    from gsplat import rasterize_gaussians
+    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
+    from gsplat.cuda_legacy._wrapper import num_sh_bases
+    GSPLAT_LEGACY = True
+except ImportError:
+    # gsplat >= 1.4.0 - use new API
+    from gsplat.utils import normalized_quat_to_rotmat as quat_to_rotmat
+    from gsplat import rasterize_to_pixels, isect_offset_encode, isect_tiles
+    num_sh_bases = lambda degree: (degree + 1) ** 2
+    GSPLAT_LEGACY = False
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -49,6 +56,7 @@ from nerfstudio.models.splatfacto import (
     get_viewmat,
 )
 from nerfstudio.utils.colors import get_color
+from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -183,8 +191,8 @@ class DNSplatterModel(SplatfactoModel):
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
-        distances, indices = self.k_nearest_sklearn(means.data, 3)
-        distances = torch.from_numpy(distances)
+        distances, indices = k_nearest_sklearn(means.data, 3)
+        # k_nearest_sklearn now returns tensors directly (no need for from_numpy)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
 
@@ -352,7 +360,7 @@ class DNSplatterModel(SplatfactoModel):
                 deleted_mask = self.cull_gaussians(splits_mask)
             elif (
                 self.step >= self.config.stop_split_at
-                and self.config.continue_cull_post_densification
+                and getattr(self.config, 'continue_cull_post_densification', True)
             ):
                 deleted_mask = self.cull_gaussians()
             else:
@@ -561,18 +569,51 @@ class DNSplatterModel(SplatfactoModel):
 
             xys = self.xys[0, ...].detach()
 
-            normals_im: Tensor = rasterize_gaussians(  # type: ignore
-                xys,
-                self.depths[0, ...],
-                self.radii,
-                self.conics[0, ...],
-                self.num_tiles_hit[0, ...],
-                normals,
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_WIDTH,
-            )
+            if GSPLAT_LEGACY:
+                # gsplat < 1.4.0 - use old rasterize_gaussians API
+                normals_im: Tensor = rasterize_gaussians(  # type: ignore
+                    xys,
+                    self.depths[0, ...],
+                    self.radii,
+                    self.conics[0, ...],
+                    self.num_tiles_hit[0, ...],
+                    normals,
+                    torch.sigmoid(opacities_crop),
+                    H,
+                    W,
+                    BLOCK_WIDTH,
+                )
+            else:
+                # gsplat >= 1.4.0 - use new rasterize_to_pixels API
+                # Get intermediate values from the info dict
+                tile_size = info.get("tile_size", BLOCK_WIDTH)
+                isect_offsets = info["isect_offsets"]  # [C, tile_height, tile_width]
+                flatten_ids = info["flatten_ids"]  # [n_isects]
+                
+                # Prepare inputs for rasterize_to_pixels
+                # means2d: [C, N, 2], conics: [C, N, 3], colors: [C, N, D], opacities: [C, N]
+                means2d = self.xys  # [1, N, 2]
+                conics = self.conics  # [1, N, 3]
+                opacities = torch.sigmoid(opacities_crop).squeeze(-1)  # [N]
+                
+                # Expand normals to match batch dimension [1, N, 3]
+                normals_batch = normals.unsqueeze(0)  # [1, N, 3]
+                opacities_batch = opacities.unsqueeze(0)  # [1, N]
+                
+                normals_im, _ = rasterize_to_pixels(
+                    means2d=means2d,
+                    conics=conics,
+                    colors=normals_batch,
+                    opacities=opacities_batch,
+                    image_width=W,
+                    image_height=H,
+                    tile_size=tile_size,
+                    isect_offsets=isect_offsets,
+                    flatten_ids=flatten_ids,
+                    backgrounds=None,
+                    packed=False,
+                )
+                normals_im = normals_im.squeeze(0)  # [H, W, 3]
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2
@@ -931,13 +972,16 @@ class DNSplatterModel(SplatfactoModel):
         cbs = []
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
+                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                self.step_cb,
+                args=[training_callback_attributes.optimizers],
             )
         )
-        # The order of these matters
+        # The order of these matters - use step_post_backward (renamed from after_train in newer nerfstudio)
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.step_post_backward,
             )
         )
         cbs.append(

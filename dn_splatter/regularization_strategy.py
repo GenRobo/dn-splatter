@@ -29,7 +29,9 @@ def mean_angular_error(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
 def dilate_edge(edge, dilation_size=1):
 
     kernel_size = 2 * dilation_size + 1
-    dilation_kernel = torch.ones((1, 1, kernel_size, kernel_size)).cuda()
+    dilation_kernel = torch.ones(
+        (1, 1, kernel_size, kernel_size), device=edge.device, dtype=edge.dtype
+    )
 
     edge_dilated = F.conv2d(edge, dilation_kernel, padding=dilation_size)
     edge_dilated = torch.clamp(edge_dilated, 0, 1)
@@ -242,14 +244,19 @@ class AGSMeshRegularization(RegularizationStrategy):
         **kwargs,
     ):
         """Regularization loss"""
-        depth_loss = self.get_depth_loss(
-            step=step,
-            pred_depth=pred_depth,
-            gt_depth=gt_depth,
-            confidence_map=confidence_map,
-            **kwargs,
-        )
-        normal_loss = self.get_normal_loss(step, surf_normal, gt_normal, pred_normal)
+        depth_loss, normal_loss = 0.0, 0.0
+        if self.depth_loss is not None:
+            depth_loss = self.get_depth_loss(
+                step=step,
+                pred_depth=pred_depth,
+                gt_depth=gt_depth,
+                confidence_map=confidence_map,
+                **kwargs,
+            )
+        if self.normal_loss is not None:
+            normal_loss = self.get_normal_loss(
+                step, surf_normal, gt_normal, pred_normal
+            )
         scales = kwargs["scales"]
         scale_loss = self.get_scale_loss(scales=scales)
         return depth_loss + normal_loss + scale_loss
@@ -258,6 +265,8 @@ class AGSMeshRegularization(RegularizationStrategy):
         """Depth loss"""
         depth_loss = 0
         depth_mask = gt_depth > self.depth_tolerance
+        if self.depth_loss is None:
+            return 0.0
         if step < 7000:
             if self.depth_loss_type == DepthLossType.EdgeAwareLogL1:
                 gt_img = kwargs["gt_img"]
@@ -272,7 +281,9 @@ class AGSMeshRegularization(RegularizationStrategy):
                     * self.depth_lambda
                 )
         elif step >= 7000:
-            gt_depth = torch.where(confidence_map > 0, gt_depth, 0).cuda()
+            gt_depth = torch.where(
+                confidence_map > 0, gt_depth, torch.zeros_like(gt_depth)
+            )
             depth_mask = gt_depth > self.depth_tolerance
             if self.depth_loss_type == DepthLossType.EdgeAwareLogL1:
                 gt_img = kwargs["gt_img"]

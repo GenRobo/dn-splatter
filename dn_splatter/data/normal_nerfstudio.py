@@ -506,13 +506,16 @@ class NormalNerfstudio(Nerfstudio):
             self.prompted_user = True
 
         if self.config.load_pcd_normals:
-            metadata.update(
-                self._load_points3D_normals(
-                    points=metadata["points3D_xyz"],
-                    colors=metadata["points3D_rgb"],
-                    transform_matrix=transform_matrix,
+            if "points3D_xyz" in metadata and "points3D_rgb" in metadata:
+                metadata.update(
+                    self._load_points3D_normals(
+                        points=metadata["points3D_xyz"],
+                        colors=metadata["points3D_rgb"],
+                        transform_matrix=transform_matrix,
+                    )
                 )
-            )
+            else:
+                CONSOLE.log("[yellow]load_pcd_normals=True but no 3D points are available; skipping PCD-normal initialization.")
 
         if self.config.load_normals:
             metadata["normal_filenames"] = normal_filenames

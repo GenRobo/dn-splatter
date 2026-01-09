@@ -24,7 +24,11 @@ dn_splatter = MethodSpecification(
             datamanager=DNSplatterManagerConfig(
                 dataparser=NormalNerfstudioConfig(load_3D_points=True)
             ),
-            model=DNSplatterModelConfig(regularization_strategy="dn-splatter"),
+            model=DNSplatterModelConfig(
+                regularization_strategy="dn-splatter",
+                use_depth_loss=True,
+                depth_lambda=0.2,
+            ),
         ),
         optimizers={
             "means": {
@@ -86,7 +90,11 @@ ags_mesh = MethodSpecification(
             datamanager=DNSplatterManagerConfig(
                 dataparser=NormalNerfstudioConfig(load_3D_points=True)
             ),
-            model=DNSplatterModelConfig(regularization_strategy="ags-mesh"),
+            model=DNSplatterModelConfig(
+                regularization_strategy="ags-mesh",
+                use_depth_loss=True,
+                depth_lambda=0.2,
+            ),
         ),
         optimizers={
             "means": {
@@ -149,7 +157,9 @@ dn_splatter_big = MethodSpecification(
             ),
             model=DNSplatterModelConfig(
                 cull_alpha_thresh=0.005,
-                continue_cull_post_densification=False,
+                # continue_cull_post_densification removed in newer nerfstudio
+                use_depth_loss=True,
+                depth_lambda=0.2,
             ),
         ),
         optimizers={

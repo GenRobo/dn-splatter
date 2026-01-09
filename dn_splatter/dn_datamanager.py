@@ -89,6 +89,10 @@ class DNSplatterDataManager(FullImageDatamanager):
 
     def next_train(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next training batch"""
+        
+        # Handle disk caching mode - delegate to parent
+        if self.config.cache_images == "disk":
+            return super().next_train(step)
 
         # Don't randomly sample train images (keep t-1, t, t+1 ordering).
         self.image_idx = self.train_unseen_cameras.pop(0)
@@ -153,6 +157,11 @@ class DNSplatterDataManager(FullImageDatamanager):
         """Returns the next evaluation batch
 
         Returns a Camera instead of raybundle"""
+        
+        # Handle disk caching mode - delegate to parent
+        if self.config.cache_images == "disk":
+            return super().next_eval(step)
+        
         image_idx = self.eval_unseen_cameras[
             random.randint(0, len(self.eval_unseen_cameras) - 1)
         ]
@@ -212,6 +221,10 @@ class DNSplatterDataManager(FullImageDatamanager):
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next eval image"""
+        
+        # Handle disk caching mode - delegate to parent
+        if self.config.cache_images == "disk":
+            return super().next_eval_image(step)
 
         image_idx = self.eval_unseen_cameras[
             random.randint(0, len(self.eval_unseen_cameras) - 1)
