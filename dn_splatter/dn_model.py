@@ -810,10 +810,10 @@ class DNSplatterModel(SplatfactoModel):
         )
         rgb_mse = self.mse_loss(gt_rgb.permute(2, 0, 1), predicted_rgb.permute(2, 0, 1))
         metrics_dict = {
-            "rgb_mse": float(rgb_mse),
+            "rgb_mse": float(rgb_mse.detach().item()),
             "rgb_psnr": float(psnr.item()),
-            "rgb_ssim": float(ssim),
-            "rgb_lpips": float(lpips),
+            "rgb_ssim": float(ssim.item()),
+            "rgb_lpips": float(lpips.item()),
         }
 
         metrics_dict["gaussian_count"] = self.num_points
@@ -824,7 +824,6 @@ class DNSplatterModel(SplatfactoModel):
                 if outputs["depth"].dim() == 4
                 else outputs["depth"]
             )
-            predicted_depth = outputs["depth"]
             (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
                 predicted_depth.permute(2, 0, 1), sensor_depth_gt.permute(2, 0, 1)
             )

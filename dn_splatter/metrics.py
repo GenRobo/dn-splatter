@@ -143,6 +143,15 @@ class DepthMetrics(nn.Module):
 
     @torch.no_grad()
     def forward(self, pred, gt):
+        if pred.shape != gt.shape:
+            # Metrics-only safety: align shapes if the dataloader produced mismatched resolutions.
+            if pred.dim() == 3 and gt.dim() == 3 and pred.shape[0] == gt.shape[0]:
+                gt = torch.nn.functional.interpolate(
+                    gt.unsqueeze(0),
+                    size=pred.shape[-2:],
+                    mode="nearest",
+                ).squeeze(0)
+
         mask = gt > self.tolerance
 
         thresh = torch.max((gt[mask] / pred[mask]), (pred[mask] / gt[mask]))

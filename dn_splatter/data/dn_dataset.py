@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from dn_splatter.utils.camera_utils import euclidean_to_z_depth
 from PIL import Image
+import torchvision.transforms.functional as TF
 
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
@@ -123,8 +124,9 @@ class GDataset(InputDataset):
         confidence_data = {}
         if self.load_depths:
             # try to load depth data
-            height = int(self._dataparser_outputs.cameras.height[data["image_idx"]])
-            width = int(self._dataparser_outputs.cameras.width[data["image_idx"]])
+            # Use the (potentially rescaled) dataset cameras so depth aligns with `scale_factor`.
+            height = int(self.cameras.height[data["image_idx"]])
+            width = int(self.cameras.width[data["image_idx"]])
             # Scale depth images to meter units and also by scaling applied to cameras
             scale_factor = (
                 self.depth_unit_scale_factor * self._dataparser_outputs.dataparser_scale
@@ -138,13 +140,13 @@ class GDataset(InputDataset):
                     scale_factor=scale_factor,
                 )
                 if self.is_euclidean_depth:
-                    fx = self._dataparser_outputs.cameras.fx[data["image_idx"]].item()
-                    fy = self._dataparser_outputs.cameras.fy[data["image_idx"]].item()
+                    fx = self.cameras.fx[data["image_idx"]].item()
+                    fy = self.cameras.fy[data["image_idx"]].item()
                     cx = int(
-                        self._dataparser_outputs.cameras.cx[data["image_idx"]].item()
+                        self.cameras.cx[data["image_idx"]].item()
                     )
                     cy = int(
-                        self._dataparser_outputs.cameras.cy[data["image_idx"]].item()
+                        self.cameras.cy[data["image_idx"]].item()
                     )
                     depth_image = euclidean_to_z_depth(
                         depth_image, fx, fy, cx, cy, (width, height), depth_image.device
@@ -176,6 +178,12 @@ class GDataset(InputDataset):
                 normal_frame=self.normal_frame,
                 c2w=camtoworld,
             )
+            if normal_image.shape[:2] != data["image"].shape[:2]:
+                normal_image = TF.resize(
+                    normal_image.permute(2, 0, 1),
+                    data["image"].shape[:2],
+                    antialias=None,
+                ).permute(1, 2, 0)
             normal_data.update({"normal": normal_image})
 
         if self.load_confidence:
