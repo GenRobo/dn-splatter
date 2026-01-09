@@ -94,12 +94,27 @@ class RGBMetrics(nn.Module):
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0, kernel_size=11)
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
+    @staticmethod
+    def _to_float01(img: torch.Tensor) -> torch.Tensor:
+        """Ensure image is float in [0, 1] for torchmetrics ops."""
+        if not torch.is_floating_point(img):
+            img = img.float() / 255.0
+        else:
+            img = img.float()
+            # Handle mis-scaled float images (e.g., 0..255).
+            if img.numel() > 0 and img.max() > 1.5:
+                img = img / 255.0
+        return img.clamp(0.0, 1.0)
+
     @torch.no_grad()
     def forward(self, pred, gt):
         self.device = pred.device
         self.psnr.to(self.device)
         self.ssim.to(self.device)
         self.lpips.to(self.device)
+
+        pred = self._to_float01(pred)
+        gt = self._to_float01(gt)
 
         psnr_score = self.psnr(pred, gt)
         ssim_score = self.ssim(pred, gt)
