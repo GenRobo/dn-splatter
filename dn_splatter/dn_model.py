@@ -38,7 +38,6 @@ try:
 except ImportError:
     # gsplat >= 1.4.0 - use new API
     from gsplat.utils import normalized_quat_to_rotmat as quat_to_rotmat
-    from gsplat import rasterize_to_pixels, isect_offset_encode, isect_tiles
     num_sh_bases = lambda degree: (degree + 1) ** 2
     GSPLAT_LEGACY = False
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
@@ -631,38 +630,33 @@ class DNSplatterModel(SplatfactoModel):
                     BLOCK_WIDTH,
                 )
             else:
-                # gsplat >= 1.4.0 - use new rasterize_to_pixels API
-                # Get intermediate values from the info dict
-                tile_size = info.get("tile_size", BLOCK_WIDTH)
-                isect_offsets = info["isect_offsets"]  # [C, tile_height, tile_width]
-                flatten_ids = info["flatten_ids"]  # [n_isects]
-                
-                # Prepare inputs for rasterize_to_pixels
-                # means2d: [C, N, 2], conics: [C, N, 3], colors: [C, N, D], opacities: [C, N]
-                means2d = self.xys  # [1, N, 2]
-                conics = self.conics  # [1, N, 3]
-                opacities = torch.sigmoid(opacities_crop).squeeze(-1)  # [N]
-                
-                # Expand normals to match batch dimension [1, N, 3]
-                normals_batch = normals.unsqueeze(0)  # [1, N, 3]
-                opacities_batch = opacities.unsqueeze(0)  # [1, N]
-                
-                normals_im, _ = rasterize_to_pixels(
-                    means2d=means2d,
-                    conics=conics,
-                    colors=normals_batch,
-                    opacities=opacities_batch,
-                    image_width=W,
-                    image_height=H,
-                    tile_size=tile_size,
-                    isect_offsets=isect_offsets,
-                    flatten_ids=flatten_ids,
-                    backgrounds=None,
+                # gsplat >= 1.4.0: render normals via a second rasterization pass.
+                # This avoids relying on internal intersection buffers that may change across gsplat versions.
+                render_n, alpha_n, _ = rasterization(
+                    means=means_crop,
+                    quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                    scales=torch.exp(scales_crop),
+                    opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                    colors=normals,
+                    viewmats=viewmat,
+                    Ks=K,
+                    width=W,
+                    height=H,
+                    tile_size=BLOCK_WIDTH,
                     packed=False,
+                    near_plane=0.01,
+                    far_plane=1e10,
+                    render_mode="RGB",
+                    sh_degree=None,
+                    sparse_grad=False,
+                    absgrad=self.strategy.absgrad
+                    if isinstance(self.strategy, DefaultStrategy)
+                    else False,
+                    rasterize_mode=self.config.rasterize_mode,
                 )
-                normals_im = normals_im.squeeze(0)  # [H, W, 3]
+                normals_im = render_n[:, ..., :3].squeeze(0)
             # convert normals from [-1,1] to [0,1]
-            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
+            normals_im = normals_im / (normals_im.norm(dim=-1, keepdim=True) + 1e-12)
             normals_im = (normals_im + 1) / 2
 
         if hasattr(camera, "metadata"):
