@@ -27,7 +27,6 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
 # gsplat 1.4.0+ compatibility - API changed from 1.0.0
 try:
@@ -40,6 +39,10 @@ except ImportError:
     from gsplat.utils import normalized_quat_to_rotmat as quat_to_rotmat
     num_sh_bases = lambda degree: (degree + 1) ** 2
     GSPLAT_LEGACY = False
+    try:
+        from gsplat import rasterize_to_pixels
+    except ImportError:
+        from gsplat.rendering import rasterize_to_pixels
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -143,6 +146,7 @@ class DNSplatterModel(SplatfactoModel):
             means = torch.nn.Parameter((torch.rand((500000, 3)) - 0.5) * 10)
         CONSOLE.log(f"Number of initial seed points {means.shape[0]}")
         self.xys_grad_norm = None
+        self.vis_counts = None
         self.max_2Dsize = None
         dim_sh = num_sh_bases(self.config.sh_degree)
         num_points = means.shape[0]
@@ -254,42 +258,6 @@ class DNSplatterModel(SplatfactoModel):
             num_cameras=self.num_train_data, device="cpu"
         )
 
-        # Strategy for GS densification (required by SplatfactoModel.step_post_backward)
-        if self.config.strategy == "default":
-            self.strategy = DefaultStrategy(
-                prune_opa=self.config.cull_alpha_thresh,
-                grow_grad2d=self.config.densify_grad_thresh,
-                grow_scale3d=self.config.densify_size_thresh,
-                grow_scale2d=self.config.split_screen_size,
-                prune_scale3d=self.config.cull_scale_thresh,
-                prune_scale2d=self.config.cull_screen_size,
-                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-                refine_start_iter=self.config.warmup_length,
-                refine_stop_iter=self.config.stop_split_at,
-                reset_every=self.config.reset_alpha_every * self.config.refine_every,
-                refine_every=self.config.refine_every,
-                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-                absgrad=self.config.use_absgrad,
-                revised_opacity=False,
-                verbose=True,
-            )
-            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
-        elif self.config.strategy == "mcmc":
-            self.strategy = MCMCStrategy(
-                cap_max=self.config.max_gs_num,
-                noise_lr=self.config.noise_lr,
-                refine_start_iter=self.config.warmup_length,
-                refine_stop_iter=self.config.stop_split_at,
-                refine_every=self.config.refine_every,
-                min_opacity=self.config.cull_alpha_thresh,
-                verbose=False,
-            )
-            self.strategy_state = self.strategy.initialize_state()
-        else:
-            raise ValueError(
-                f"Splatfacto does not support strategy {self.config.strategy}; supported: default, mcmc."
-            )
-
         if self.config.regularization_strategy == "dn-splatter":
             self.regularization_strategy = DNRegularization()
         elif self.config.regularization_strategy == "ags-mesh":
@@ -311,6 +279,46 @@ class DNSplatterModel(SplatfactoModel):
     @property
     def normals(self):
         return self.gauss_params["normals"]
+
+    def step_cb(self, optimizers: Optimizers, step):
+        """Track step and optimizers for refinement callbacks.
+
+        Newer nerfstudio passes `optimizers` to callbacks; DN-Splatter's original
+        code only tracked `step`.
+        """
+        self.optimizers = optimizers
+        self.step = step
+
+    def after_train(self, step: int):
+        assert step == self.step
+        # To save some training time, we no longer need to update those stats post refinement.
+        if self.step >= self.config.stop_split_at:
+            return
+
+        if self.xys.grad is None:
+            return
+
+        with torch.no_grad():
+            visible_mask = (self.radii > 0).flatten()
+            grads = self.xys.grad.detach().abs()[0][visible_mask].norm(dim=-1)
+            if self.xys_grad_norm is None:
+                self.xys_grad_norm = torch.zeros(
+                    self.num_points, device=self.device, dtype=torch.float32
+                )
+                self.vis_counts = torch.ones(
+                    self.num_points, device=self.device, dtype=torch.float32
+                )
+            assert self.vis_counts is not None
+            self.vis_counts[visible_mask] += 1
+            self.xys_grad_norm[visible_mask] += grads
+
+            if self.max_2Dsize is None:
+                self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
+            newradii = self.radii.detach()[visible_mask]
+            self.max_2Dsize[visible_mask] = torch.maximum(
+                self.max_2Dsize[visible_mask],
+                newradii / float(max(self.last_size[0], self.last_size[1])),
+            )
 
     def refinement_after(self, optimizers: Optimizers, step):
         assert step == self.step
@@ -526,10 +534,7 @@ class DNSplatterModel(SplatfactoModel):
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        if self.config.output_depth_during_training or not self.training:
-            render_mode = "RGB+ED"
-        else:
-            render_mode = "RGB"
+        render_mode = "RGB+ED"
 
         if self.config.sh_degree > 0:
             sh_degree_to_use = min(
@@ -539,7 +544,7 @@ class DNSplatterModel(SplatfactoModel):
             colors_crop = torch.sigmoid(colors_crop)
             sh_degree_to_use = None
 
-        render, alpha, self.info = rasterization(
+        render, alpha, info = rasterization(
             means=means_crop,
             quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
             scales=torch.exp(scales_crop),
@@ -556,18 +561,12 @@ class DNSplatterModel(SplatfactoModel):
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            absgrad=self.strategy.absgrad
-            if isinstance(self.strategy, DefaultStrategy)
-            else False,
+            absgrad=True,
             rasterize_mode=self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
-        info = self.info
-        if self.training:
-            self.strategy.step_pre_backward(
-                self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
-            )
+        self.info = info
         if self.training and info["means2d"].requires_grad:
             info["means2d"].retain_grad()
         self.xys = info["means2d"]  # [1, N, 2]
@@ -630,31 +629,22 @@ class DNSplatterModel(SplatfactoModel):
                     BLOCK_WIDTH,
                 )
             else:
-                # gsplat >= 1.4.0: render normals via a second rasterization pass.
-                # This avoids relying on internal intersection buffers that may change across gsplat versions.
-                render_n, alpha_n, _ = rasterization(
-                    means=means_crop,
-                    quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-                    scales=torch.exp(scales_crop),
-                    opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-                    colors=normals,
-                    viewmats=viewmat,
-                    Ks=K,
-                    width=W,
-                    height=H,
+                # gsplat >= 1.4.0: reuse the main-pass intersection buffers (closest
+                # to the original DN-Splatter behavior).
+                normals_render, _ = rasterize_to_pixels(
+                    means2d=self.xys.detach(),
+                    conics=self.conics.detach(),
+                    colors=normals.unsqueeze(0),
+                    opacities=self.info["opacities"].detach(),
+                    image_width=W,
+                    image_height=H,
                     tile_size=BLOCK_WIDTH,
+                    isect_offsets=self.info["isect_offsets"],
+                    flatten_ids=self.info["flatten_ids"],
                     packed=False,
-                    near_plane=0.01,
-                    far_plane=1e10,
-                    render_mode="RGB",
-                    sh_degree=None,
-                    sparse_grad=False,
-                    absgrad=self.strategy.absgrad
-                    if isinstance(self.strategy, DefaultStrategy)
-                    else False,
-                    rasterize_mode=self.config.rasterize_mode,
+                    absgrad=True,
                 )
-                normals_im = render_n[:, ..., :3].squeeze(0)
+                normals_im = normals_render.squeeze(0)
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / (normals_im.norm(dim=-1, keepdim=True) + 1e-12)
             normals_im = (normals_im + 1) / 2
@@ -1017,11 +1007,18 @@ class DNSplatterModel(SplatfactoModel):
                 args=[training_callback_attributes.optimizers],
             )
         )
-        # The order of these matters - use step_post_backward (renamed from after_train in newer nerfstudio)
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.step_post_backward,
+                self.after_train,
+            )
+        )
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.refinement_after,
+                update_every_num_iters=self.config.refine_every,
+                args=[training_callback_attributes.optimizers],
             )
         )
 
